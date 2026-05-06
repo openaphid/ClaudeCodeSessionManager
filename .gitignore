@@ -1,0 +1,23 @@
+# Build output
+/ccsm
+/dist/
+/bin/
+
+# Go
+*.exe
+*.test
+*.prof
+*.out
+coverage.txt
+vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local env
+.env
+.env.local
