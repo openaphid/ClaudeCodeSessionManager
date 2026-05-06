@@ -18,8 +18,12 @@ func renderPreview(s *session.Session, width int) string {
 		width = 10
 	}
 	var sb strings.Builder
-	header := fmt.Sprintf("Session %s\nProject: %s\nBranch: %s · Version: %s · Events: %d",
-		s.ID, s.CWD, valOr(s.GitBranch, "-"), valOr(s.Version, "-"), s.NumEvents)
+	title := s.DisplayName()
+	if title == "" {
+		title = "(no title)"
+	}
+	header := fmt.Sprintf("%s\nID: %s\nProject: %s\nBranch: %s · Version: %s · Events: %d",
+		title, s.ID, s.CWD, valOr(s.GitBranch, "-"), valOr(s.Version, "-"), s.NumEvents)
 	sb.WriteString(dimStyle.Render(header))
 	sb.WriteString("\n\n")
 

@@ -52,13 +52,22 @@ type sessionItem struct {
 	s *session.Session
 }
 
-func (i sessionItem) FilterValue() string { return i.s.FirstPrompt + " " + i.s.ID }
+func (i sessionItem) FilterValue() string {
+	return i.s.CustomTitle + " " + i.s.AITitle + " " + i.s.FirstPrompt + " " + i.s.ID
+}
 func (i sessionItem) Title() string {
-	prompt := i.s.FirstPrompt
-	if prompt == "" {
-		prompt = "(no user prompt)"
+	name := i.s.DisplayName()
+	if name == "" {
+		return "(no title)"
 	}
-	return prompt
+	switch {
+	case i.s.CustomTitle != "":
+		return "★ " + name
+	case i.s.AITitle != "":
+		return "✦ " + name
+	default:
+		return name
+	}
 }
 func (i sessionItem) Description() string {
 	when := i.s.ModTime.Format("01-02 15:04")

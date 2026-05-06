@@ -50,6 +50,40 @@ func TestLoadHeader(t *testing.T) {
 	}
 }
 
+func TestLoadHeaderTitles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.jsonl")
+	body := `{"type":"user","message":{"role":"user","content":"first ask"},"uuid":"u1","timestamp":"2026-05-01T14:07:33Z"}
+{"type":"ai-title","aiTitle":"Auto Title","sessionId":"x"}
+{"type":"ai-title","aiTitle":"Auto Title v2","sessionId":"x"}
+{"type":"custom-title","customTitle":"my-renamed-session","sessionId":"x"}
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{Path: path}
+	if err := s.LoadHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if s.AITitle != "Auto Title v2" {
+		t.Errorf("AITitle=%q want last value", s.AITitle)
+	}
+	if s.CustomTitle != "my-renamed-session" {
+		t.Errorf("CustomTitle=%q", s.CustomTitle)
+	}
+	if s.DisplayName() != "my-renamed-session" {
+		t.Errorf("DisplayName=%q want custom title to win", s.DisplayName())
+	}
+	s.CustomTitle = ""
+	if s.DisplayName() != "Auto Title v2" {
+		t.Errorf("DisplayName fallback to AI title failed: %q", s.DisplayName())
+	}
+	s.AITitle = ""
+	if s.DisplayName() != "first ask" {
+		t.Errorf("DisplayName fallback to first prompt failed: %q", s.DisplayName())
+	}
+}
+
 func TestCleanPromptDropsWrappers(t *testing.T) {
 	in := "<command-name>/plugin</command-name>"
 	if got := cleanPrompt(in); got != "" {

@@ -15,17 +15,19 @@ import (
 // Event is one line of a Claude Code session JSONL transcript.
 // Unknown fields are tolerated; only fields used by the UI are decoded.
 type Event struct {
-	Type       string          `json:"type"`
-	UUID       string          `json:"uuid"`
-	ParentUUID string          `json:"parentUuid"`
-	SessionID  string          `json:"sessionId"`
-	CWD        string          `json:"cwd"`
-	GitBranch  string          `json:"gitBranch"`
-	Version    string          `json:"version"`
-	IsMeta     bool            `json:"isMeta"`
-	IsSidechain bool           `json:"isSidechain"`
-	Timestamp  string          `json:"timestamp"`
-	Message    json.RawMessage `json:"message"`
+	Type        string          `json:"type"`
+	UUID        string          `json:"uuid"`
+	ParentUUID  string          `json:"parentUuid"`
+	SessionID   string          `json:"sessionId"`
+	CWD         string          `json:"cwd"`
+	GitBranch   string          `json:"gitBranch"`
+	Version     string          `json:"version"`
+	IsMeta      bool            `json:"isMeta"`
+	IsSidechain bool            `json:"isSidechain"`
+	Timestamp   string          `json:"timestamp"`
+	Message     json.RawMessage `json:"message"`
+	CustomTitle string          `json:"customTitle"`
+	AITitle     string          `json:"aiTitle"`
 }
 
 // Message is the inner Claude API message, simplified.
@@ -44,19 +46,34 @@ type ContentBlock struct {
 
 // Session is a parsed view of one .jsonl transcript.
 type Session struct {
-	ID         string
-	Path       string
-	Project    *Project
-	Size       int64
-	ModTime    time.Time
+	ID          string
+	Path        string
+	Project     *Project
+	Size        int64
+	ModTime     time.Time
 	FirstPrompt string
-	LastTime   time.Time
-	NumEvents  int
-	NumUser    int
-	NumAsst    int
-	GitBranch  string
-	Version    string
-	CWD        string
+	CustomTitle string // user-set name via /rename or sidebar
+	AITitle     string // auto-generated summary
+	LastTime    time.Time
+	NumEvents   int
+	NumUser     int
+	NumAsst     int
+	GitBranch   string
+	Version     string
+	CWD         string
+}
+
+// DisplayName picks the best label for the session: user rename > AI title >
+// first user prompt. Empty if nothing usable was recorded.
+func (s *Session) DisplayName() string {
+	switch {
+	case s.CustomTitle != "":
+		return s.CustomTitle
+	case s.AITitle != "":
+		return s.AITitle
+	default:
+		return s.FirstPrompt
+	}
 }
 
 // Project groups sessions for one working directory.
@@ -207,6 +224,14 @@ func (s *Session) LoadHeader() error {
 			}
 		case "assistant":
 			s.NumAsst++
+		case "custom-title":
+			if ev.CustomTitle != "" {
+				s.CustomTitle = ev.CustomTitle
+			}
+		case "ai-title":
+			if ev.AITitle != "" {
+				s.AITitle = ev.AITitle
+			}
 		}
 	}
 	return scanner.Err()
