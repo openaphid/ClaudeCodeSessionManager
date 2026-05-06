@@ -120,10 +120,14 @@ func ListProjects() ([]*Project, error) {
 		if len(p.Sessions) == 0 {
 			continue
 		}
-		// project mtime = newest session mtime
+		// project mtime = newest session mtime; prefer any session's recorded
+		// cwd over the lossy dir-name decode for display.
 		for _, s := range p.Sessions {
 			if s.ModTime.After(p.ModTime) {
 				p.ModTime = s.ModTime
+			}
+			if s.CWD != "" && p.CWD != s.CWD {
+				p.CWD = s.CWD
 			}
 		}
 		out = append(out, p)

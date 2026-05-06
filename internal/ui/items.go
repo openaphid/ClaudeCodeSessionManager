@@ -17,11 +17,30 @@ type projectItem struct {
 
 func (i projectItem) FilterValue() string { return i.p.CWD }
 func (i projectItem) Title() string {
-	name := filepath.Base(i.p.CWD)
-	if name == "" || name == "/" {
+	name := projectDisplayName(i.p.CWD)
+	if name == "" {
 		name = i.p.Dir
 	}
 	return fmt.Sprintf("%s (%d)", name, len(i.p.Sessions))
+}
+
+// projectDisplayName picks a readable label for a project cwd.
+// Worktrees of the form `<parent>/.claude/worktrees/<name>` are rendered
+// as `<parent-base> [<worktree-name>]` so the user sees the originating
+// project at a glance instead of a bare worktree slug.
+func projectDisplayName(cwd string) string {
+	if cwd == "" || cwd == "/" {
+		return ""
+	}
+	base := filepath.Base(cwd)
+	parent := filepath.Dir(cwd)
+	if filepath.Base(parent) == "worktrees" && filepath.Base(filepath.Dir(parent)) == ".claude" {
+		project := filepath.Base(filepath.Dir(filepath.Dir(parent)))
+		if project != "" && project != "/" {
+			return fmt.Sprintf("%s [%s]", project, base)
+		}
+	}
+	return base
 }
 func (i projectItem) Description() string {
 	age := humanAge(time.Since(i.p.ModTime))
