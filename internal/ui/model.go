@@ -75,6 +75,8 @@ type keymap struct {
 	ScrollPgDown key.Binding
 	ScrollTop    key.Binding
 	ScrollBot    key.Binding
+	PrevPage     key.Binding
+	NextPage     key.Binding
 }
 
 var keys = keymap{
@@ -94,6 +96,9 @@ var keys = keymap{
 	ScrollPgDown: key.NewBinding(key.WithKeys("pgdown")),
 	ScrollTop:    key.NewBinding(key.WithKeys("g", "home")),
 	ScrollBot:    key.NewBinding(key.WithKeys("G", "end")),
+	// Page scroll via left/right — preview-pane only so lists keep arrows for nav.
+	PrevPage:     key.NewBinding(key.WithKeys("left", "h")),
+	NextPage:     key.NewBinding(key.WithKeys("right", "l")),
 }
 
 // NewModel builds an initial Model with projects loaded.
@@ -186,6 +191,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.ScrollBot):
 			if m.focus == panePreview {
 				m.preview.GotoBottom()
+				return m, nil
+			}
+		case key.Matches(msg, keys.PrevPage):
+			if m.focus == panePreview {
+				m.preview.ViewUp()
+				return m, nil
+			}
+		case key.Matches(msg, keys.NextPage):
+			if m.focus == panePreview {
+				m.preview.ViewDown()
 				return m, nil
 			}
 
