@@ -20,6 +20,7 @@ type pane int
 const (
 	paneProjects pane = iota
 	paneSessions
+	panePreview
 )
 
 // confirmKind tracks which destructive action a y/N prompt is asking about.
@@ -60,23 +61,39 @@ func (m Model) ResumeRequest() (sessionID, cwd string, ok bool) {
 }
 
 type keymap struct {
-	Tab     key.Binding
-	Resume  key.Binding
-	Delete  key.Binding
-	Refresh key.Binding
-	Quit    key.Binding
-	Yes     key.Binding
-	No      key.Binding
+	Tab          key.Binding
+	ShiftTab     key.Binding
+	Resume       key.Binding
+	Delete       key.Binding
+	Refresh      key.Binding
+	Quit         key.Binding
+	Yes          key.Binding
+	No           key.Binding
+	ScrollUp     key.Binding
+	ScrollDown   key.Binding
+	ScrollPgUp   key.Binding
+	ScrollPgDown key.Binding
+	ScrollTop    key.Binding
+	ScrollBot    key.Binding
 }
 
 var keys = keymap{
-	Tab:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch pane")),
-	Resume:  key.NewBinding(key.WithKeys("enter", "r"), key.WithHelp("enter/r", "resume")),
-	Delete:  key.NewBinding(key.WithKeys("d", "delete"), key.WithHelp("d", "delete")),
-	Refresh: key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
-	Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "quit")),
-	Yes:     key.NewBinding(key.WithKeys("y", "Y")),
-	No:      key.NewBinding(key.WithKeys("n", "N", "esc")),
+	Tab:          key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next pane")),
+	ShiftTab:     key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev pane")),
+	Resume:       key.NewBinding(key.WithKeys("enter", "r"), key.WithHelp("enter/r", "resume")),
+	Delete:       key.NewBinding(key.WithKeys("d", "delete"), key.WithHelp("d", "delete")),
+	Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
+	Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "quit")),
+	Yes:          key.NewBinding(key.WithKeys("y", "Y")),
+	No:           key.NewBinding(key.WithKeys("n", "N", "esc")),
+	// Always-on preview scroll. Don't collide with list nav (j/k, up/down)
+	// when the lists have focus — pgup/pgdn, ctrl+u/d, home/end are safe.
+	ScrollUp:     key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("ctrl+u", "preview ½pg up")),
+	ScrollDown:   key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("ctrl+d", "preview ½pg dn")),
+	ScrollPgUp:   key.NewBinding(key.WithKeys("pgup")),
+	ScrollPgDown: key.NewBinding(key.WithKeys("pgdown")),
+	ScrollTop:    key.NewBinding(key.WithKeys("g", "home")),
+	ScrollBot:    key.NewBinding(key.WithKeys("G", "end")),
 }
 
 // NewModel builds an initial Model with projects loaded.
@@ -148,12 +165,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case key.Matches(msg, keys.Tab):
-			if m.focus == paneProjects {
-				m.focus = paneSessions
-			} else {
-				m.focus = paneProjects
-			}
+			m.focus = (m.focus + 1) % 3
 			return m, nil
+
+		case key.Matches(msg, keys.ShiftTab):
+			m.focus = (m.focus + 2) % 3
+			return m, nil
+
+		// Always-on preview scrolling — works from any pane.
+		case key.Matches(msg, keys.ScrollUp, keys.ScrollDown,
+			keys.ScrollPgUp, keys.ScrollPgDown):
+			m.preview, cmd = m.preview.Update(msg)
+			return m, cmd
+		case key.Matches(msg, keys.ScrollTop):
+			// scope g/home to preview pane so lists keep their own bindings
+			if m.focus == panePreview {
+				m.preview.GotoTop()
+				return m, nil
+			}
+		case key.Matches(msg, keys.ScrollBot):
+			if m.focus == panePreview {
+				m.preview.GotoBottom()
+				return m, nil
+			}
 
 		case key.Matches(msg, keys.Refresh):
 			ps, err := session.ListProjects()
@@ -188,7 +222,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// route input to the focused list, otherwise scroll preview
+	// route input to the focused pane
 	switch m.focus {
 	case paneProjects:
 		prev := m.projList.Index()
@@ -203,6 +237,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.sessList.Index() != prev {
 			m.refreshPreview()
 		}
+	case panePreview:
+		m.preview, cmd = m.preview.Update(msg)
 	}
 	return m, cmd
 }
@@ -342,10 +378,13 @@ func (m Model) View() string {
 	pStyle := panelBorder
 	sStyle := panelBorder
 	prevStyle := panelBorder
-	if m.focus == paneProjects {
+	switch m.focus {
+	case paneProjects:
 		pStyle = panelBorderFocus
-	} else {
+	case paneSessions:
 		sStyle = panelBorderFocus
+	case panePreview:
+		prevStyle = panelBorderFocus
 	}
 
 	left := lipgloss.JoinVertical(lipgloss.Left,
@@ -369,7 +408,7 @@ func (m Model) footer() string {
 		}
 		return errStyle.Render(fmt.Sprintf("Delete session %s? [y/N]", id))
 	}
-	help := "tab: switch · enter/r: resume · d: delete · R: refresh · /: filter · q: quit"
+	help := "tab: pane · enter/r: resume · d: delete · pgup/pgdn/ctrl+u/d: scroll · g/G: top/bot · R: refresh · /: filter · q: quit"
 	if m.err != nil {
 		return errStyle.Render(m.err.Error()) + "  " + helpStyle.Render(help)
 	}
