@@ -10,7 +10,7 @@ import (
 
 // renderPreview formats a session's events into the right-hand pane.
 // width is the inner content width (excluding border/padding).
-func renderPreview(s *session.Session, width int) string {
+func renderPreview(s *session.Session, width int, markdown bool) string {
 	if s == nil {
 		return ""
 	}
@@ -53,7 +53,16 @@ func renderPreview(s *session.Session, width int) string {
 		sb.WriteString(label)
 		sb.WriteString(when)
 		sb.WriteString("\n")
-		sb.WriteString(wrap(text, width))
+		switch ev.Type {
+		case "user", "assistant":
+			if markdown {
+				sb.WriteString(renderMarkdown(text, width))
+			} else {
+				sb.WriteString(wrap(text, width))
+			}
+		default:
+			sb.WriteString(wrap(text, width))
+		}
 		sb.WriteString("\n\n")
 		count++
 		return count < maxBlocks

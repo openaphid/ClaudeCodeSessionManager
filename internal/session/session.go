@@ -263,6 +263,26 @@ func (s *Session) Delete() error {
 	return os.Remove(s.Path)
 }
 
+// DeleteAll removes every session file in the project. Returns the number of
+// files removed and the first error encountered (deletion continues past
+// individual failures so partial cleanup still happens). Caller must have
+// confirmed.
+func (p *Project) DeleteAll() (int, error) {
+	var firstErr error
+	n := 0
+	for _, s := range p.Sessions {
+		if err := s.Delete(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		n++
+	}
+	p.Sessions = nil
+	return n, firstErr
+}
+
 // firstText pulls a short text excerpt from a Message.Content payload.
 // Content can be a JSON string OR an array of blocks.
 func firstText(raw json.RawMessage) string {

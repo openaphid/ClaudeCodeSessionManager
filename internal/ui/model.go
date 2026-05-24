@@ -29,21 +29,24 @@ type confirmKind int
 const (
 	confirmNone confirmKind = iota
 	confirmDelete
+	confirmDeleteProject
 )
 
 // Model is the root bubbletea model.
 type Model struct {
-	projects   []*session.Project
-	projList   list.Model
-	sessList   list.Model
-	preview    viewport.Model
-	focus      pane
-	width      int
-	height     int
-	status     string
-	err        error
-	confirm    confirmKind
-	resumeReq  *resumeRequest // set on quit when user picks resume
+	projects      []*session.Project
+	projList      list.Model
+	sessList      list.Model
+	preview       viewport.Model
+	focus         pane
+	width         int
+	height        int
+	status        string
+	err           error
+	confirm       confirmKind
+	confirmChoice bool // false = No (default), true = Yes
+	markdown      bool // render user/assistant text as markdown
+	resumeReq     *resumeRequest // set on quit when user picks resume
 }
 
 // resumeRequest is filled in just before quit so the caller (main) can re-exec.
@@ -61,11 +64,13 @@ func (m Model) ResumeRequest() (sessionID, cwd string, ok bool) {
 }
 
 type keymap struct {
-	Tab          key.Binding
-	ShiftTab     key.Binding
-	Resume       key.Binding
-	Delete       key.Binding
-	Refresh      key.Binding
+	Tab           key.Binding
+	ShiftTab      key.Binding
+	Resume        key.Binding
+	Delete        key.Binding
+	DeleteProject key.Binding
+	Markdown      key.Binding
+	Refresh       key.Binding
 	Quit         key.Binding
 	Yes          key.Binding
 	No           key.Binding
@@ -83,8 +88,10 @@ var keys = keymap{
 	Tab:          key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next pane")),
 	ShiftTab:     key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev pane")),
 	Resume:       key.NewBinding(key.WithKeys("enter", "r"), key.WithHelp("enter/r", "resume")),
-	Delete:       key.NewBinding(key.WithKeys("d", "delete"), key.WithHelp("d", "delete")),
-	Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
+	Delete:        key.NewBinding(key.WithKeys("d", "delete"), key.WithHelp("d", "delete")),
+	DeleteProject: key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete project")),
+	Markdown:      key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle markdown")),
+	Refresh:       key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
 	Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "quit")),
 	Yes:          key.NewBinding(key.WithKeys("y", "Y")),
 	No:           key.NewBinding(key.WithKeys("n", "N", "esc")),
@@ -127,6 +134,7 @@ func NewModel(projects []*session.Project) Model {
 		sessList: sl,
 		preview:  vp,
 		focus:    paneProjects,
+		markdown: true,
 	}
 }
 
@@ -153,6 +161,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, keys.No):
 				m.confirm = confirmNone
 				m.status = "cancelled"
+				return m, nil
+			case msg.String() == "left", msg.String() == "right",
+				msg.String() == "h", msg.String() == "l",
+				msg.String() == "tab", msg.String() == "shift+tab":
+				m.confirmChoice = !m.confirmChoice
+				return m, nil
+			case msg.String() == "enter":
+				if m.confirmChoice {
+					m.applyConfirm()
+				} else {
+					m.status = "cancelled"
+				}
+				m.confirm = confirmNone
 				return m, nil
 			}
 			return m, nil
@@ -232,8 +253,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.Delete):
 			if m.focus == paneSessions && m.currentSession() != nil {
 				m.confirm = confirmDelete
+				m.confirmChoice = false // default No
 				return m, nil
 			}
+
+		case key.Matches(msg, keys.DeleteProject):
+			if m.focus == paneProjects && m.currentProject() != nil {
+				m.confirm = confirmDeleteProject
+				m.confirmChoice = false // default No
+				return m, nil
+			}
+
+		case key.Matches(msg, keys.Markdown):
+			// don't swallow `m` while a list filter is being typed
+			if m.focus == paneProjects && m.projList.FilterState() == list.Filtering {
+				break
+			}
+			if m.focus == paneSessions && m.sessList.FilterState() == list.Filtering {
+				break
+			}
+			m.markdown = !m.markdown
+			m.reRenderPreview()
+			if m.markdown {
+				m.status = "markdown on"
+			} else {
+				m.status = "markdown off"
+			}
+			return m, nil
 		}
 	}
 
@@ -269,14 +315,30 @@ func (m *Model) syncSessionsForCurrentProject() {
 }
 
 func (m *Model) refreshPreview() {
+	m.setPreview(true)
+}
+
+// reRenderPreview re-renders the current session without scrolling to top —
+// used when toggling render flags (e.g. markdown) so the user keeps their
+// place in the transcript.
+func (m *Model) reRenderPreview() {
+	m.setPreview(false)
+}
+
+func (m *Model) setPreview(resetScroll bool) {
 	s := m.currentSession()
 	if s == nil {
 		m.preview.SetContent(dimStyle.Render("(no session selected)"))
 		return
 	}
 	innerW := m.previewInnerWidth()
-	m.preview.SetContent(renderPreview(s, innerW))
-	m.preview.GotoTop()
+	prevOffset := m.preview.YOffset
+	m.preview.SetContent(renderPreview(s, innerW, m.markdown))
+	if resetScroll {
+		m.preview.GotoTop()
+		return
+	}
+	m.preview.SetYOffset(prevOffset) // viewport clamps to content bounds
 }
 
 func (m Model) currentProject() *session.Project {
@@ -324,20 +386,39 @@ func (m *Model) applyConfirm() {
 		}
 		p.Sessions = out
 		if len(p.Sessions) == 0 {
-			// drop project too
-			ps := m.projects[:0]
-			for _, x := range m.projects {
-				if x != p {
-					ps = append(ps, x)
-				}
-			}
-			m.projects = ps
-			m.projList.SetItems(projectsToItems(m.projects))
+			m.removeProject(p)
 		}
 		m.syncSessionsForCurrentProject()
 		m.refreshPreview()
 		m.status = "deleted " + s.ID
+
+	case confirmDeleteProject:
+		p := m.currentProject()
+		if p == nil {
+			return
+		}
+		n, err := p.DeleteAll()
+		if err != nil {
+			m.err = err
+			m.status = fmt.Sprintf("delete project failed (deleted %d): %s", n, err.Error())
+			return
+		}
+		m.removeProject(p)
+		m.syncSessionsForCurrentProject()
+		m.refreshPreview()
+		m.status = fmt.Sprintf("deleted project %s (%d sessions)", p.CWD, n)
 	}
+}
+
+func (m *Model) removeProject(p *session.Project) {
+	ps := m.projects[:0]
+	for _, x := range m.projects {
+		if x != p {
+			ps = append(ps, x)
+		}
+	}
+	m.projects = ps
+	m.projList.SetItems(projectsToItems(m.projects))
 }
 
 func (m *Model) layout() {
@@ -411,19 +492,78 @@ func (m Model) View() string {
 
 	footer := m.footer()
 
+	if m.confirm != confirmNone {
+		bodyH := lipgloss.Height(body)
+		body = lipgloss.Place(m.width, bodyH, lipgloss.Center, lipgloss.Center, m.confirmDialog())
+	}
+
 	return strings.Join([]string{header, body, footer}, "\n")
 }
 
-func (m Model) footer() string {
-	if m.confirm == confirmDelete {
+func (m Model) confirmDialog() string {
+	var title, info string
+	switch m.confirm {
+	case confirmDelete:
+		title = errStyle.Render("Delete session?")
 		s := m.currentSession()
-		id := ""
 		if s != nil {
-			id = s.ID
+			info = s.ID + "\n" + dimStyle.Render(s.Path)
 		}
-		return errStyle.Render(fmt.Sprintf("Delete session %s? [y/N]", id))
+	case confirmDeleteProject:
+		title = errStyle.Render("Delete ALL sessions in project?")
+		p := m.currentProject()
+		if p != nil {
+			info = fmt.Sprintf("%s\n%s",
+				p.CWD,
+				dimStyle.Render(fmt.Sprintf("%d sessions · %s", len(p.Sessions), p.Path)))
+		}
 	}
-	help := "tab: pane · enter/r: resume · d: delete · pgup/pgdn/ctrl+u/d: scroll · g/G: top/bot · R: refresh · /: filter · q: quit"
+
+	yesLabel := "  Yes  "
+	noLabel := "  No  "
+	if m.confirmChoice {
+		yesLabel = selectedStyle.Render("▶ Yes ◀")
+		noLabel = dimStyle.Render("  No   ")
+	} else {
+		yesLabel = dimStyle.Render("  Yes  ")
+		noLabel = selectedStyle.Render("▶ No  ◀")
+	}
+	buttons := lipgloss.JoinHorizontal(lipgloss.Top, yesLabel, "    ", noLabel)
+	hint := helpStyle.Render("←/→ switch · enter confirm · esc cancel")
+
+	content := lipgloss.JoinVertical(lipgloss.Center, title, "", info, "", buttons, "", hint)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("160")).
+		Padding(1, 4).
+		Render(content)
+}
+
+// paneHelp returns shortcut hints relevant to the focused pane. Always-on
+// keys (tab/quit/refresh) live in the common prefix; pane-specific keys come
+// next.
+func (m Model) paneHelp() string {
+	md := "off"
+	if m.markdown {
+		md = "on"
+	}
+	common := fmt.Sprintf("tab/shift+tab: pane · m: md(%s) · R: refresh · q: quit", md)
+	switch m.focus {
+	case paneProjects:
+		return "D: delete project · /: filter · " + common
+	case paneSessions:
+		return "enter/r: resume · d: delete · /: filter · " + common
+	case panePreview:
+		return "pgup/pgdn · ctrl+u/d: ½pg · ←/→: page · g/G: top/bot · " + common
+	}
+	return common
+}
+
+func (m Model) footer() string {
+	if m.confirm != confirmNone {
+		return errStyle.Render("Awaiting confirmation… (←/→ to switch, enter to apply, esc to cancel)")
+	}
+	help := m.paneHelp()
 	if m.err != nil {
 		return errStyle.Render(m.err.Error()) + "  " + helpStyle.Render(help)
 	}
