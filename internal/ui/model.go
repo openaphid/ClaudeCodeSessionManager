@@ -47,12 +47,19 @@ type Model struct {
 	confirmChoice bool // false = No (default), true = Yes
 	markdown      bool // render user/assistant text as markdown
 	resumeReq     *resumeRequest // set on quit when user picks resume
+	newReq        *newSessionRequest // set on quit when user picks new session
 }
 
 // resumeRequest is filled in just before quit so the caller (main) can re-exec.
 type resumeRequest struct {
 	SessionID string
 	CWD       string
+}
+
+// newSessionRequest is filled in just before quit when the user wants to
+// launch a fresh `claude` session in a project's cwd.
+type newSessionRequest struct {
+	CWD string
 }
 
 // ResumeRequest exposes the resume target after Run returns.
@@ -63,12 +70,21 @@ func (m Model) ResumeRequest() (sessionID, cwd string, ok bool) {
 	return m.resumeReq.SessionID, m.resumeReq.CWD, true
 }
 
+// NewSessionRequest exposes the new-session target after Run returns.
+func (m Model) NewSessionRequest() (cwd string, ok bool) {
+	if m.newReq == nil {
+		return "", false
+	}
+	return m.newReq.CWD, true
+}
+
 type keymap struct {
 	Tab           key.Binding
 	ShiftTab      key.Binding
 	Resume        key.Binding
 	Delete        key.Binding
 	DeleteProject key.Binding
+	NewSession    key.Binding
 	Markdown      key.Binding
 	Refresh       key.Binding
 	Quit         key.Binding
@@ -90,6 +106,7 @@ var keys = keymap{
 	Resume:       key.NewBinding(key.WithKeys("enter", "r"), key.WithHelp("enter/r", "resume")),
 	Delete:        key.NewBinding(key.WithKeys("d", "delete"), key.WithHelp("d", "delete")),
 	DeleteProject: key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete project")),
+	NewSession:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new session")),
 	Markdown:      key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle markdown")),
 	Refresh:       key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
 	Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "quit")),
@@ -263,6 +280,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmChoice = false // default No
 				return m, nil
 			}
+
+		case key.Matches(msg, keys.NewSession):
+			// don't swallow `n` while a list filter is being typed
+			if m.focus == paneProjects && m.projList.FilterState() == list.Filtering {
+				break
+			}
+			if m.focus == paneSessions && m.sessList.FilterState() == list.Filtering {
+				break
+			}
+			p := m.currentProject()
+			if p == nil {
+				return m, nil
+			}
+			cwd := p.CWD
+			if cwd == "" || cwd == "/" {
+				m.status = "cannot start: project cwd unknown"
+				return m, nil
+			}
+			m.newReq = &newSessionRequest{CWD: cwd}
+			return m, tea.Quit
 
 		case key.Matches(msg, keys.Markdown):
 			// don't swallow `m` while a list filter is being typed
@@ -550,9 +587,9 @@ func (m Model) paneHelp() string {
 	common := fmt.Sprintf("tab/shift+tab: pane · m: md(%s) · R: refresh · q: quit", md)
 	switch m.focus {
 	case paneProjects:
-		return "D: delete project · /: filter · " + common
+		return "n: new · D: delete project · /: filter · " + common
 	case paneSessions:
-		return "enter/r: resume · d: delete · /: filter · " + common
+		return "enter/r: resume · n: new · d: delete · /: filter · " + common
 	case panePreview:
 		return "pgup/pgdn · ctrl+u/d: ½pg · ←/→: page · g/G: top/bot · " + common
 	}
@@ -581,6 +618,22 @@ func Resume(sessionID, cwd string) error {
 		return fmt.Errorf("claude binary not in PATH: %w", err)
 	}
 	cmd := exec.Command(bin, "--resume", sessionID)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	cmd.Stdin = stdin()
+	cmd.Stdout = stdout()
+	cmd.Stderr = stderr()
+	return cmd.Run()
+}
+
+// NewSession re-execs a fresh `claude` (no --resume) in the given cwd.
+func NewSession(cwd string) error {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude binary not in PATH: %w", err)
+	}
+	cmd := exec.Command(bin)
 	if cwd != "" {
 		cmd.Dir = cwd
 	}

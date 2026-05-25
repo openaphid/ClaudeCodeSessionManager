@@ -58,6 +58,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "resume failed:", err)
 			os.Exit(1)
 		}
+		return
+	}
+	if cwd, ok := fm.NewSessionRequest(); ok {
+		if err := ui.NewSession(cwd); err != nil {
+			fmt.Fprintln(os.Stderr, "new session failed:", err)
+			os.Exit(1)
+		}
 	}
 }
 
