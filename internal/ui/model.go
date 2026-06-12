@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -48,7 +49,19 @@ type Model struct {
 	markdown      bool // render user/assistant text as markdown
 	resumeReq     *resumeRequest // set on quit when user picks resume
 	newReq        *newSessionRequest // set on quit when user picks new session
+	procStart     time.Time     // process start, for first-frame latency
+	firstFrame    time.Duration // procStart -> first WindowSizeMsg handled (incl. first preview render)
 }
+
+// WithStartTime arms first-frame latency measurement against t.
+func (m Model) WithStartTime(t time.Time) Model {
+	m.procStart = t
+	return m
+}
+
+// FirstFrame returns how long the first full layout+preview took, measured
+// from the start time set via WithStartTime. Zero if never armed/reached.
+func (m Model) FirstFrame() time.Duration { return m.firstFrame }
 
 // resumeRequest is filled in just before quit so the caller (main) can re-exec.
 type resumeRequest struct {
@@ -165,6 +178,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		m.refreshPreview()
+		if m.firstFrame == 0 && !m.procStart.IsZero() {
+			m.firstFrame = time.Since(m.procStart)
+		}
 		return m, nil
 
 	case tea.KeyMsg:

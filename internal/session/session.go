@@ -58,6 +58,7 @@ type Session struct {
 	NumEvents   int
 	NumUser     int
 	NumAsst     int
+	LoadDur     time.Duration // wall time spent in LoadHeader during the scan
 	GitBranch   string
 	Version     string
 	CWD         string
@@ -176,7 +177,9 @@ func (p *Project) loadSessions() error {
 			ModTime: fi.ModTime(),
 		}
 		// header parse: first user prompt, counts. cheap enough on demand.
+		t0 := time.Now()
 		_ = s.LoadHeader()
+		s.LoadDur = time.Since(t0)
 		p.Sessions = append(p.Sessions, s)
 	}
 	sort.Slice(p.Sessions, func(i, j int) bool {
