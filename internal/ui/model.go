@@ -31,6 +31,7 @@ const (
 	confirmNone confirmKind = iota
 	confirmDelete
 	confirmDeleteProject
+	confirmResumeActive
 )
 
 // Model is the root bubbletea model.
@@ -45,12 +46,14 @@ type Model struct {
 	status        string
 	err           error
 	confirm       confirmKind
-	confirmChoice bool // false = No (default), true = Yes
-	markdown      bool // render user/assistant text as markdown
-	resumeReq     *resumeRequest // set on quit when user picks resume
-	newReq        *newSessionRequest // set on quit when user picks new session
-	procStart     time.Time     // process start, for first-frame latency
-	firstFrame    time.Duration // procStart -> first WindowSizeMsg handled (incl. first preview render)
+	confirmChoice bool                             // false = No (default), true = Yes
+	conflict      *session.ActiveSession           // live process owning the session a resume would collide with
+	active        map[string]session.ActiveSession // live sessions by id, for the list ● marker; refreshed on load/R
+	markdown      bool                             // render user/assistant text as markdown
+	resumeReq     *resumeRequest                   // set on quit when user picks resume
+	newReq        *newSessionRequest               // set on quit when user picks new session
+	procStart     time.Time                        // process start, for first-frame latency
+	firstFrame    time.Duration                    // procStart -> first WindowSizeMsg handled (incl. first preview render)
 }
 
 // WithStartTime arms first-frame latency measurement against t.
@@ -100,31 +103,31 @@ type keymap struct {
 	NewSession    key.Binding
 	Markdown      key.Binding
 	Refresh       key.Binding
-	Quit         key.Binding
-	Yes          key.Binding
-	No           key.Binding
-	ScrollUp     key.Binding
-	ScrollDown   key.Binding
-	ScrollPgUp   key.Binding
-	ScrollPgDown key.Binding
-	ScrollTop    key.Binding
-	ScrollBot    key.Binding
-	PrevPage     key.Binding
-	NextPage     key.Binding
+	Quit          key.Binding
+	Yes           key.Binding
+	No            key.Binding
+	ScrollUp      key.Binding
+	ScrollDown    key.Binding
+	ScrollPgUp    key.Binding
+	ScrollPgDown  key.Binding
+	ScrollTop     key.Binding
+	ScrollBot     key.Binding
+	PrevPage      key.Binding
+	NextPage      key.Binding
 }
 
 var keys = keymap{
-	Tab:          key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next pane")),
-	ShiftTab:     key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev pane")),
-	Resume:       key.NewBinding(key.WithKeys("enter", "r"), key.WithHelp("enter/r", "resume")),
+	Tab:           key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next pane")),
+	ShiftTab:      key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev pane")),
+	Resume:        key.NewBinding(key.WithKeys("enter", "r"), key.WithHelp("enter/r", "resume")),
 	Delete:        key.NewBinding(key.WithKeys("d", "delete"), key.WithHelp("d", "delete")),
 	DeleteProject: key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete project")),
 	NewSession:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new session")),
 	Markdown:      key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle markdown")),
 	Refresh:       key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
-	Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "quit")),
-	Yes:          key.NewBinding(key.WithKeys("y", "Y")),
-	No:           key.NewBinding(key.WithKeys("n", "N", "esc")),
+	Quit:          key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "quit")),
+	Yes:           key.NewBinding(key.WithKeys("y", "Y")),
+	No:            key.NewBinding(key.WithKeys("n", "N", "esc")),
 	// Always-on preview scroll. Don't collide with list nav (j/k, up/down)
 	// when the lists have focus — pgup/pgdn, ctrl+u/d, home/end are safe.
 	ScrollUp:     key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("ctrl+u", "preview ½pg up")),
@@ -134,8 +137,8 @@ var keys = keymap{
 	ScrollTop:    key.NewBinding(key.WithKeys("g", "home")),
 	ScrollBot:    key.NewBinding(key.WithKeys("G", "end")),
 	// Page scroll via left/right — preview-pane only so lists keep arrows for nav.
-	PrevPage:     key.NewBinding(key.WithKeys("left", "h")),
-	NextPage:     key.NewBinding(key.WithKeys("right", "l")),
+	PrevPage: key.NewBinding(key.WithKeys("left", "h")),
+	NextPage: key.NewBinding(key.WithKeys("right", "l")),
 }
 
 // NewModel builds an initial Model with projects loaded.
@@ -152,8 +155,10 @@ func NewModel(projects []*session.Project) Model {
 	sl.SetShowStatusBar(false)
 	sl.Styles.Title = titleStyle
 
+	active, _ := session.ActiveSessions() // best-effort; nil map is a safe lookup
+
 	if len(projects) > 0 {
-		sl.SetItems(sessionsToItems(projects[0].Sessions))
+		sl.SetItems(sessionsToItems(projects[0].Sessions, active))
 	}
 
 	vp := viewport.New(0, 0)
@@ -165,6 +170,7 @@ func NewModel(projects []*session.Project) Model {
 		preview:  vp,
 		focus:    paneProjects,
 		markdown: true,
+		active:   active,
 	}
 }
 
@@ -190,9 +196,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, keys.Yes):
 				m.applyConfirm()
 				m.confirm = confirmNone
+				if m.resumeReq != nil {
+					return m, tea.Quit
+				}
 				return m, nil
 			case key.Matches(msg, keys.No):
 				m.confirm = confirmNone
+				m.conflict = nil
 				m.status = "cancelled"
 				return m, nil
 			case msg.String() == "left", msg.String() == "right",
@@ -207,6 +217,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status = "cancelled"
 				}
 				m.confirm = confirmNone
+				if m.confirmChoice && m.resumeReq != nil {
+					return m, tea.Quit
+				}
 				return m, nil
 			}
 			return m, nil
@@ -265,6 +278,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.projects = ps
+			m.active, _ = session.ActiveSessions()
 			m.projList.SetItems(projectsToItems(ps))
 			m.syncSessionsForCurrentProject()
 			m.refreshPreview()
@@ -278,6 +292,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			s := m.currentSession()
 			if s == nil {
+				return m, nil
+			}
+			// Guard against opening a transcript another live `claude` already
+			// owns — concurrent appends to the same JSONL corrupt history.
+			if a := m.activeConflict(s.ID); a != nil {
+				m.conflict = a
+				m.confirm = confirmResumeActive
+				m.confirmChoice = false // default No
 				return m, nil
 			}
 			m.resumeReq = &resumeRequest{SessionID: s.ID, CWD: s.CWD}
@@ -363,7 +385,7 @@ func (m *Model) syncSessionsForCurrentProject() {
 		m.sessList.SetItems(nil)
 		return
 	}
-	m.sessList.SetItems(sessionsToItems(p.Sessions))
+	m.sessList.SetItems(sessionsToItems(p.Sessions, m.active))
 	m.sessList.ResetSelected()
 }
 
@@ -417,8 +439,31 @@ func (m Model) currentSession() *session.Session {
 	return p.Sessions[idx]
 }
 
+// activeConflict reports the live `claude` process already holding sessionID,
+// or nil if none. Read at resume time (not cached) so it reflects the moment of
+// the keypress. Best-effort: a registry read error is treated as "no conflict"
+// — failing open keeps resume working when the check can't run.
+func (m Model) activeConflict(sessionID string) *session.ActiveSession {
+	active, err := session.ActiveSessions()
+	if err != nil {
+		return nil
+	}
+	if a, ok := active[sessionID]; ok {
+		return &a
+	}
+	return nil
+}
+
 func (m *Model) applyConfirm() {
 	switch m.confirm {
+	case confirmResumeActive:
+		s := m.currentSession()
+		if s == nil {
+			return
+		}
+		m.resumeReq = &resumeRequest{SessionID: s.ID, CWD: s.CWD}
+		m.conflict = nil
+
 	case confirmDelete:
 		s := m.currentSession()
 		if s == nil {
@@ -556,6 +601,21 @@ func (m Model) View() string {
 func (m Model) confirmDialog() string {
 	var title, info string
 	switch m.confirm {
+	case confirmResumeActive:
+		title = errStyle.Render("Session already open!")
+		if m.conflict != nil {
+			where := m.conflict.CWD
+			if where == "" {
+				where = "(unknown cwd)"
+			}
+			detail := fmt.Sprintf("live in pid %d · %s", m.conflict.PID, where)
+			if m.conflict.Status != "" {
+				detail += " · " + m.conflict.Status
+			}
+			info = m.conflict.SessionID + "\n" +
+				dimStyle.Render(detail) + "\n\n" +
+				dimStyle.Render("Resuming will let two processes write the same\ntranscript and corrupt its history.")
+		}
 	case confirmDelete:
 		title = errStyle.Render("Delete session?")
 		s := m.currentSession()

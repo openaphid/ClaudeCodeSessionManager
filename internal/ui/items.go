@@ -47,9 +47,12 @@ func (i projectItem) Description() string {
 	return fmt.Sprintf("%s · %s ago", i.p.CWD, age)
 }
 
-// sessionItem wraps a *session.Session for the list bubble.
+// sessionItem wraps a *session.Session for the list bubble. live marks a
+// session a running `claude` currently owns — a hint computed at list-build
+// time; the authoritative collision check still runs at resume.
 type sessionItem struct {
-	s *session.Session
+	s    *session.Session
+	live bool
 }
 
 func (i sessionItem) FilterValue() string {
@@ -58,16 +61,19 @@ func (i sessionItem) FilterValue() string {
 func (i sessionItem) Title() string {
 	name := i.s.DisplayName()
 	if name == "" {
-		return "(no title)"
+		name = "(no title)"
+	} else {
+		switch {
+		case i.s.CustomTitle != "":
+			name = "★ " + name
+		case i.s.AITitle != "":
+			name = "✦ " + name
+		}
 	}
-	switch {
-	case i.s.CustomTitle != "":
-		return "★ " + name
-	case i.s.AITitle != "":
-		return "✦ " + name
-	default:
-		return name
+	if i.live {
+		name = "● " + name
 	}
+	return name
 }
 func (i sessionItem) Description() string {
 	when := i.s.ModTime.Format("01-02 15:04")
@@ -109,10 +115,11 @@ func projectsToItems(ps []*session.Project) []list.Item {
 	return out
 }
 
-func sessionsToItems(ss []*session.Session) []list.Item {
+func sessionsToItems(ss []*session.Session, active map[string]session.ActiveSession) []list.Item {
 	out := make([]list.Item, len(ss))
 	for i, s := range ss {
-		out[i] = sessionItem{s}
+		_, live := active[s.ID]
+		out[i] = sessionItem{s: s, live: live}
 	}
 	return out
 }

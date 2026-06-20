@@ -46,3 +46,5 @@ Three packages, one binary.
 ## External
 
 No runtime services. Reads `~/.claude/projects/` and shells out to `claude` (must be on `$PATH`) for resume. Honors `$CLAUDE_HOME` to override the projects root.
+
+Also reads the live-session registry Claude Code keeps at `<claude-home>/sessions/<pid>.json` (each holds `pid`, `sessionId`, `cwd`, `status`). `session.ActiveSessions` parses these, drops entries whose pid is dead (`syscall.Kill(pid,0)`), and keys the rest by `sessionId`. The UI checks this at resume time and pops a confirm (`confirmResumeActive`) before opening a transcript a running `claude` already owns — two processes appending the same JSONL corrupt its history. Best-effort: a missing registry dir or read error fails open (resume proceeds).
