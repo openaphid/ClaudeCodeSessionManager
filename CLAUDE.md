@@ -31,10 +31,12 @@ Three packages, one binary.
   - `Session.LoadHeader` streams JSONL with `bufio.Scanner` (1 MiB initial / 16 MiB max line) — transcripts can be hundreds of MiB.
   - `Session.LoadEvents(fn)` is the streaming reader used by the preview pane; the callback returns `false` to stop early.
   - `DecodeDirToCWD` reverses Claude Code's dir encoding (leading `/` becomes `-`, every `/` becomes `-`). Lossy: a real `-` in the path collides. Display only — never round-trip back to disk.
+  - `State` (`state.go`) is ccsm's own per-session/per-project flag memory at `<claude-home>/ccsm/state.json` (`LoadState`/`Save`). Best-effort like `ActiveSessions`: missing/malformed → empty maps, write errors are non-fatal. Claude Code persists no launch flags anywhere, so this is the only record of which flags a session resumed with.
 - `internal/ui` — bubbletea model.
   - Layout: left column = projects list (top) + sessions list (bottom); right column = scrollable preview viewport. Tab switches focus between the two left lists; preview always tracks the selected session.
-  - `Model.Update` short-circuits all input when `confirm != confirmNone` — the y/N prompt for delete must consume the next keystroke before anything else runs.
-  - Resume is implemented as "set `resumeReq`, return `tea.Quit`, let main re-exec." Do NOT shell out from inside `Update` — bubbletea owns the terminal.
+  - `Model.Update` short-circuits all input when `confirm != confirmNone` (destructive y/N) and, separately, when `dialog != dialogNone` (the resume/new flag flow). The two states are mutually exclusive; a flag dialog that hits a live-session conflict closes itself and hands off to `confirmResumeActive`, carrying flags via `pendingArgs`.
+  - Resume/new can pass extra `claude` flags (e.g. `--chrome`). `enter`/`r` opens a Simple/With-flags chooser (default remembered per session); `n` opens a flag input (default remembered per project cwd). Flags are split by `splitArgs` (`args.go`, quote-aware; drops `--resume`/`-r`/`--continue`/`-c`).
+  - Resume is implemented as "set `resumeReq` (with `ExtraArgs`), return `tea.Quit`, let main re-exec." Do NOT shell out from inside `Update` — bubbletea owns the terminal.
 
 ## Conventions
 
@@ -45,6 +47,6 @@ Three packages, one binary.
 
 ## External
 
-No runtime services. Reads `~/.claude/projects/` and shells out to `claude` (must be on `$PATH`) for resume. Honors `$CLAUDE_HOME` to override the projects root.
+No runtime services. Reads `~/.claude/projects/` and shells out to `claude` (must be on `$PATH`) for resume/new — appending any user-chosen extra flags after `--resume <id>`. Honors `$CLAUDE_HOME` to override the projects root. Writes its own flag memory to `<claude-home>/ccsm/state.json` (see `session.State`).
 
 Also reads the live-session registry Claude Code keeps at `<claude-home>/sessions/<pid>.json` (each holds `pid`, `sessionId`, `cwd`, `status`). `session.ActiveSessions` parses these, drops entries whose pid is dead (`syscall.Kill(pid,0)`), and keys the rest by `sessionId`. The UI checks this at resume time and pops a confirm (`confirmResumeActive`) before opening a transcript a running `claude` already owns — two processes appending the same JSONL corrupt its history. Best-effort: a missing registry dir or read error fails open (resume proceeds).

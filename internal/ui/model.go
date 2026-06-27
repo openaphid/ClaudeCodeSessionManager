@@ -8,6 +8,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -34,6 +35,18 @@ const (
 	confirmResumeActive
 )
 
+// dialogKind tracks which resume/new flag dialog is open. Separate from
+// confirmKind: confirm owns the destructive y/N prompts, dialog owns the
+// (non-destructive) flag flow that feeds resume/new-session.
+type dialogKind int
+
+const (
+	dialogNone         dialogKind = iota
+	dialogResumeChoice            // pick: simple resume vs resume with flags
+	dialogResumeFlags             // text input for resume flags
+	dialogNewFlags                // text input for new-session flags
+)
+
 // Model is the root bubbletea model.
 type Model struct {
 	projects      []*session.Project
@@ -54,6 +67,15 @@ type Model struct {
 	newReq        *newSessionRequest               // set on quit when user picks new session
 	procStart     time.Time                        // process start, for first-frame latency
 	firstFrame    time.Duration                    // procStart -> first WindowSizeMsg handled (incl. first preview render)
+
+	// flag-dialog state (resume choice / flag input)
+	dialog          dialogKind
+	choiceWithFlags bool            // selection in dialogResumeChoice (true = with flags)
+	flagInput       textinput.Model // shared input for the flag dialogs
+	dialogSessID    string          // resume target while a dialog is open
+	dialogCWD       string          // resume/new target cwd while a dialog is open
+	pendingArgs     []string        // flags carried through the confirmResumeActive detour
+	state           session.State   // persisted per-session/per-project flag memory
 }
 
 // WithStartTime arms first-frame latency measurement against t.
@@ -70,28 +92,30 @@ func (m Model) FirstFrame() time.Duration { return m.firstFrame }
 type resumeRequest struct {
 	SessionID string
 	CWD       string
+	ExtraArgs []string // extra flags to pass to `claude` (e.g. --chrome)
 }
 
 // newSessionRequest is filled in just before quit when the user wants to
 // launch a fresh `claude` session in a project's cwd.
 type newSessionRequest struct {
-	CWD string
+	CWD       string
+	ExtraArgs []string // extra flags to pass to `claude` (e.g. --chrome)
 }
 
 // ResumeRequest exposes the resume target after Run returns.
-func (m Model) ResumeRequest() (sessionID, cwd string, ok bool) {
+func (m Model) ResumeRequest() (sessionID, cwd string, extraArgs []string, ok bool) {
 	if m.resumeReq == nil {
-		return "", "", false
+		return "", "", nil, false
 	}
-	return m.resumeReq.SessionID, m.resumeReq.CWD, true
+	return m.resumeReq.SessionID, m.resumeReq.CWD, m.resumeReq.ExtraArgs, true
 }
 
 // NewSessionRequest exposes the new-session target after Run returns.
-func (m Model) NewSessionRequest() (cwd string, ok bool) {
+func (m Model) NewSessionRequest() (cwd string, extraArgs []string, ok bool) {
 	if m.newReq == nil {
-		return "", false
+		return "", nil, false
 	}
-	return m.newReq.CWD, true
+	return m.newReq.CWD, m.newReq.ExtraArgs, true
 }
 
 type keymap struct {
@@ -156,6 +180,7 @@ func NewModel(projects []*session.Project) Model {
 	sl.Styles.Title = titleStyle
 
 	active, _ := session.ActiveSessions() // best-effort; nil map is a safe lookup
+	state, _ := session.LoadState()       // best-effort; empty maps on error
 
 	if len(projects) > 0 {
 		sl.SetItems(sessionsToItems(projects[0].Sessions, active))
@@ -171,6 +196,7 @@ func NewModel(projects []*session.Project) Model {
 		focus:    paneProjects,
 		markdown: true,
 		active:   active,
+		state:    state,
 	}
 }
 
@@ -178,6 +204,17 @@ func (m Model) Init() tea.Cmd { return nil }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+
+	// While a flag input is open, let it consume its own async messages (cursor
+	// blink) so the cursor animates. Keys still flow through the switch below.
+	if m.dialog == dialogResumeFlags || m.dialog == dialogNewFlags {
+		switch msg.(type) {
+		case tea.KeyMsg, tea.WindowSizeMsg:
+		default:
+			m.flagInput, cmd = m.flagInput.Update(msg)
+			return m, cmd
+		}
+	}
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -203,6 +240,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, keys.No):
 				m.confirm = confirmNone
 				m.conflict = nil
+				m.pendingArgs = nil
 				m.status = "cancelled"
 				return m, nil
 			case msg.String() == "left", msg.String() == "right",
@@ -215,6 +253,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.applyConfirm()
 				} else {
 					m.status = "cancelled"
+					m.pendingArgs = nil
 				}
 				m.confirm = confirmNone
 				if m.confirmChoice && m.resumeReq != nil {
@@ -223,6 +262,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+		}
+
+		// flag dialogs (resume choice / flag input) capture all keys
+		if m.dialog != dialogNone {
+			return m.updateDialog(msg)
 		}
 
 		switch {
@@ -294,16 +338,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if s == nil {
 				return m, nil
 			}
-			// Guard against opening a transcript another live `claude` already
-			// owns — concurrent appends to the same JSONL corrupt history.
-			if a := m.activeConflict(s.ID); a != nil {
-				m.conflict = a
-				m.confirm = confirmResumeActive
-				m.confirmChoice = false // default No
-				return m, nil
-			}
-			m.resumeReq = &resumeRequest{SessionID: s.ID, CWD: s.CWD}
-			return m, tea.Quit
+			// Open the resume choice dialog. Default to whatever this session
+			// last did (simple vs with-flags); the conflict check runs once the
+			// flags are resolved (see finishResume).
+			m.dialogSessID = s.ID
+			m.dialogCWD = s.CWD
+			m.choiceWithFlags = m.state.Resume[s.ID].WithFlags
+			m.dialog = dialogResumeChoice
+			return m, nil
 
 		case key.Matches(msg, keys.Delete):
 			if m.focus == paneSessions && m.currentSession() != nil {
@@ -336,8 +378,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "cannot start: project cwd unknown"
 				return m, nil
 			}
-			m.newReq = &newSessionRequest{CWD: cwd}
-			return m, tea.Quit
+			m.dialogCWD = cwd
+			m.flagInput = newFlagInput(m.state.New[cwd])
+			m.dialog = dialogNewFlags
+			return m, textinput.Blink
 
 		case key.Matches(msg, keys.Markdown):
 			// don't swallow `m` while a list filter is being typed
@@ -454,6 +498,135 @@ func (m Model) activeConflict(sessionID string) *session.ActiveSession {
 	return nil
 }
 
+// newFlagInput builds a focused text input for the flag dialogs, prefilled with
+// (and cursor at the end of) prev.
+func newFlagInput(prev string) textinput.Model {
+	ti := textinput.New()
+	ti.Prompt = "flags: "
+	ti.Placeholder = "--chrome --model opus …"
+	ti.Width = 40
+	ti.SetValue(prev)
+	ti.CursorEnd()
+	ti.Focus()
+	return ti
+}
+
+// closeDialog clears all transient flag-dialog state.
+func (m *Model) closeDialog() {
+	m.dialog = dialogNone
+	m.choiceWithFlags = false
+	m.flagInput = textinput.Model{}
+	m.dialogSessID = ""
+	m.dialogCWD = ""
+}
+
+// saveState persists the flag memory. Best-effort: a write failure is surfaced
+// to the status line but never blocks resume.
+func (m *Model) saveState() {
+	if err := m.state.Save(); err != nil {
+		m.status = "warning: could not save flag memory: " + err.Error()
+	}
+}
+
+// updateDialog handles keys while a resume/new flag dialog is open. It returns
+// the new model and command, fully owning input until the dialog closes.
+func (m Model) updateDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+	switch m.dialog {
+	case dialogResumeChoice:
+		switch msg.String() {
+		case "esc":
+			m.closeDialog()
+			m.status = "cancelled"
+			return m, nil
+		case "left", "right", "h", "l", "up", "down", "j", "k", "tab", "shift+tab":
+			m.choiceWithFlags = !m.choiceWithFlags
+			return m, nil
+		case "1":
+			m.choiceWithFlags = false
+			return m, nil
+		case "2":
+			m.choiceWithFlags = true
+			return m, nil
+		case "enter":
+			if m.choiceWithFlags {
+				m.dialog = dialogResumeFlags
+				m.flagInput = newFlagInput(m.state.Resume[m.dialogSessID].Flags)
+				return m, textinput.Blink
+			}
+			// simple resume: remember the choice (keep any stored flags for
+			// next time's prefill), then resume.
+			rs := m.state.Resume[m.dialogSessID]
+			rs.WithFlags = false
+			m.state.Resume[m.dialogSessID] = rs
+			m.saveState()
+			return m.finishResume(nil)
+		}
+		return m, nil
+
+	case dialogResumeFlags:
+		switch msg.String() {
+		case "esc":
+			m.closeDialog()
+			m.status = "cancelled"
+			return m, nil
+		case "enter":
+			val := strings.TrimSpace(m.flagInput.Value())
+			args := splitArgs(val)
+			m.state.Resume[m.dialogSessID] = session.ResumeState{Flags: val, WithFlags: true}
+			m.saveState()
+			return m.finishResume(args)
+		}
+		var cmd tea.Cmd
+		m.flagInput, cmd = m.flagInput.Update(msg)
+		return m, cmd
+
+	case dialogNewFlags:
+		switch msg.String() {
+		case "esc":
+			m.closeDialog()
+			m.status = "cancelled"
+			return m, nil
+		case "enter":
+			val := strings.TrimSpace(m.flagInput.Value())
+			args := splitArgs(val)
+			if val == "" {
+				delete(m.state.New, m.dialogCWD)
+			} else {
+				m.state.New[m.dialogCWD] = val
+			}
+			m.saveState()
+			m.newReq = &newSessionRequest{CWD: m.dialogCWD, ExtraArgs: args}
+			return m, tea.Quit
+		}
+		var cmd tea.Cmd
+		m.flagInput, cmd = m.flagInput.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+// finishResume runs the live-session conflict check and either pops the
+// confirmResumeActive prompt or sets the resume request and quits. args is the
+// resolved extra flags (nil for a simple resume).
+func (m Model) finishResume(args []string) (tea.Model, tea.Cmd) {
+	id, cwd := m.dialogSessID, m.dialogCWD
+	m.closeDialog()
+	// Guard against opening a transcript another live `claude` already owns —
+	// concurrent appends to the same JSONL corrupt history.
+	if a := m.activeConflict(id); a != nil {
+		m.conflict = a
+		m.pendingArgs = args
+		m.confirm = confirmResumeActive
+		m.confirmChoice = false // default No
+		return m, nil
+	}
+	m.resumeReq = &resumeRequest{SessionID: id, CWD: cwd, ExtraArgs: args}
+	return m, tea.Quit
+}
+
 func (m *Model) applyConfirm() {
 	switch m.confirm {
 	case confirmResumeActive:
@@ -461,7 +634,8 @@ func (m *Model) applyConfirm() {
 		if s == nil {
 			return
 		}
-		m.resumeReq = &resumeRequest{SessionID: s.ID, CWD: s.CWD}
+		m.resumeReq = &resumeRequest{SessionID: s.ID, CWD: s.CWD, ExtraArgs: m.pendingArgs}
+		m.pendingArgs = nil
 		m.conflict = nil
 
 	case confirmDelete:
@@ -593,9 +767,42 @@ func (m Model) View() string {
 	if m.confirm != confirmNone {
 		bodyH := lipgloss.Height(body)
 		body = lipgloss.Place(m.width, bodyH, lipgloss.Center, lipgloss.Center, m.confirmDialog())
+	} else if m.dialog != dialogNone {
+		bodyH := lipgloss.Height(body)
+		body = lipgloss.Place(m.width, bodyH, lipgloss.Center, lipgloss.Center, m.flagDialog())
 	}
 
 	return strings.Join([]string{header, body, footer}, "\n")
+}
+
+// flagDialog renders the resume choice menu or the flag text input.
+func (m Model) flagDialog() string {
+	switch m.dialog {
+	case dialogResumeChoice:
+		title := titleStyle.Render(" Resume session ")
+		info := dimStyle.Render(m.dialogSessID)
+		simple := dimStyle.Render("  Simple  ")
+		withFlags := dimStyle.Render("  With flags  ")
+		if m.choiceWithFlags {
+			withFlags = selectedStyle.Render("▶ With flags ◀")
+		} else {
+			simple = selectedStyle.Render("▶ Simple ◀")
+		}
+		buttons := lipgloss.JoinHorizontal(lipgloss.Top, simple, "    ", withFlags)
+		hint := helpStyle.Render("←/→ switch · enter confirm · esc cancel")
+		content := lipgloss.JoinVertical(lipgloss.Center, title, "", info, "", buttons, "", hint)
+		return dialogBoxStyle.Render(content)
+
+	case dialogResumeFlags, dialogNewFlags:
+		title := titleStyle.Render(" Resume with flags ")
+		if m.dialog == dialogNewFlags {
+			title = titleStyle.Render(" New session with flags ")
+		}
+		hint := helpStyle.Render("enter confirm · esc cancel · empty = none")
+		content := lipgloss.JoinVertical(lipgloss.Left, title, "", m.flagInput.View(), "", hint)
+		return dialogBoxStyle.Render(content)
+	}
+	return ""
 }
 
 func (m Model) confirmDialog() string {
@@ -663,9 +870,9 @@ func (m Model) paneHelp() string {
 	common := fmt.Sprintf("tab/shift+tab: pane · m: md(%s) · R: refresh · q: quit", md)
 	switch m.focus {
 	case paneProjects:
-		return "n: new · D: delete project · /: filter · " + common
+		return "n: new(+flags) · D: delete project · /: filter · " + common
 	case paneSessions:
-		return "enter/r: resume · n: new · d: delete · /: filter · " + common
+		return "enter/r: resume(+flags) · n: new · d: delete · /: filter · " + common
 	case panePreview:
 		return "pgup/pgdn · ctrl+u/d: ½pg · ←/→: page · g/G: top/bot · " + common
 	}
@@ -675,6 +882,9 @@ func (m Model) paneHelp() string {
 func (m Model) footer() string {
 	if m.confirm != confirmNone {
 		return errStyle.Render("Awaiting confirmation… (←/→ to switch, enter to apply, esc to cancel)")
+	}
+	if m.dialog != dialogNone {
+		return helpStyle.Render("enter: confirm · esc: cancel")
 	}
 	help := m.paneHelp()
 	if m.err != nil {
@@ -686,14 +896,16 @@ func (m Model) footer() string {
 	return helpStyle.Render(help)
 }
 
-// Resume re-execs `claude --resume <id>` in the session's cwd. Called by main
-// after the bubbletea program has fully torn down, so stdin/tty are clean.
-func Resume(sessionID, cwd string) error {
+// Resume re-execs `claude --resume <id> [extraArgs...]` in the session's cwd.
+// Called by main after the bubbletea program has fully torn down, so stdin/tty
+// are clean.
+func Resume(sessionID, cwd string, extraArgs []string) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude binary not in PATH: %w", err)
 	}
-	cmd := exec.Command(bin, "--resume", sessionID)
+	args := append([]string{"--resume", sessionID}, extraArgs...)
+	cmd := exec.Command(bin, args...)
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
@@ -703,13 +915,14 @@ func Resume(sessionID, cwd string) error {
 	return cmd.Run()
 }
 
-// NewSession re-execs a fresh `claude` (no --resume) in the given cwd.
-func NewSession(cwd string) error {
+// NewSession re-execs a fresh `claude [extraArgs...]` (no --resume) in the given
+// cwd.
+func NewSession(cwd string, extraArgs []string) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude binary not in PATH: %w", err)
 	}
-	cmd := exec.Command(bin)
+	cmd := exec.Command(bin, extraArgs...)
 	if cwd != "" {
 		cmd.Dir = cwd
 	}

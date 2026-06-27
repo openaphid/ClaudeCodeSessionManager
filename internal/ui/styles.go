@@ -46,4 +46,11 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("212")).
 				Padding(0, 1)
+
+	// dialogBoxStyle frames the (non-destructive) resume/new flag dialogs.
+	// Pink border distinguishes them from the red destructive-confirm box.
+	dialogBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("212")).
+			Padding(1, 4)
 )

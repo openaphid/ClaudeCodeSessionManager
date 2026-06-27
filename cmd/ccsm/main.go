@@ -75,15 +75,15 @@ func main() {
 	// firstframe = process start -> first layout+preview rendered. The gap
 	// between this and the scan line is bubbletea/terminal/glamour init.
 	appendTimingLine("firstframe=%dms scan=%dms", fm.FirstFrame().Milliseconds(), scanDur.Milliseconds())
-	if id, cwd, ok := fm.ResumeRequest(); ok {
-		if err := ui.Resume(id, cwd); err != nil {
+	if id, cwd, args, ok := fm.ResumeRequest(); ok {
+		if err := ui.Resume(id, cwd, args); err != nil {
 			fmt.Fprintln(os.Stderr, "resume failed:", err)
 			os.Exit(1)
 		}
 		return
 	}
-	if cwd, ok := fm.NewSessionRequest(); ok {
-		if err := ui.NewSession(cwd); err != nil {
+	if cwd, args, ok := fm.NewSessionRequest(); ok {
+		if err := ui.NewSession(cwd, args); err != nil {
 			fmt.Fprintln(os.Stderr, "new session failed:", err)
 			os.Exit(1)
 		}
